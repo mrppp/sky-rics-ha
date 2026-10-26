@@ -1,0 +1,13 @@
+send_command:
+  name: Send key
+  description: >-
+    Send exactly one RICS key to the permitted device. Requires
+    allow_key_commands: true; forbidden pseudo-keys are always blocked.
+  fields:
+    key:
+      name: Key
+      description: RICS key name, e.g. Info, Power, VolumeUp, Home, ArrowUp.
+      required: true
+      example: Info
+      selector:
+        text:

@@ -1,0 +1,12 @@
+{
+  "domain": "sky_rics_ha",
+  "name": "Sky RICS HA (research)",
+  "version": "0.1.0",
+  "documentation": "https://github.com/opencode-sky-rics-research",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": [],
+  "config_flow": false,
+  "iot_class": "local_polling",
+  "integration_type": "hub"
+}
