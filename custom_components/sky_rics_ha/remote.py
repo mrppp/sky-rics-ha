@@ -15,19 +15,13 @@ from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
 from .const import (ATTR_KEY, CONF_ALLOW_KEYS, CONF_EXCLUSIONS, CONF_MAC,
                     CONF_PORT, CONF_TARGETS, DOMAIN, ALLOWED_KEYS, FORBIDDEN_KEYS)
-from .hub import SkyRicsHub
+from .hub import SkyRicsHub, get_hub
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    hub = SkyRicsHub(
-        mac=config[CONF_MAC],
-        exclusions_path=config.get(CONF_EXCLUSIONS, ""),
-        targets_path=config.get(CONF_TARGETS, ""),
-        port=config.get(CONF_PORT, 8091),
-        allow_keys=config.get(CONF_ALLOW_KEYS, False),
-    )
+    hub = get_hub(hass, config)
     name = config.get(CONF_NAME, "Sky Glass")
     entity = SkyRicsRemote(hass, hub, name)
     async_add_entities([entity])

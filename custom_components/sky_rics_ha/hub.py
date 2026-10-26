@@ -13,9 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from .const import (CONF_ALLOW_KEYS, CONF_EXCLUSIONS, CONF_MAC, CONF_PORT,
+                    CONF_REDACT, CONF_TARGETS, DOMAIN)
 
 if TYPE_CHECKING:  # pragma: no cover
     from homeassistant.core import HomeAssistant
@@ -48,8 +51,30 @@ class SkyRicsHub:
     allow_keys: bool = False
     host: str = ""  # resolved dynamically by MAC
 
+    # Last session outcome. Updated only by real sessions, never by polling,
+    # so the bound sensor reflects history instead of re-authenticating.
+    last_session: dict = field(default_factory=lambda: {
+        "bound": None, "reason": "no-session", "device_name": "", "bind_id": None,
+    })
+    _listeners: list = field(default_factory=list)
+
     def __post_init__(self):
         self._policy = None  # loaded lazily inside executor-thread operations
+
+    # -- change notification --------------------------------------------------
+
+    def add_listener(self, callback):
+        """Register a no-arg callback; returns an unsubscribe function."""
+        self._listeners.append(callback)
+        return lambda: self._listeners.remove(callback)
+
+    def _set_session(self, **kwargs) -> None:
+        self.last_session = {**self.last_session, **kwargs}
+        for callback in list(self._listeners):
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - a bad listener must not break a send
+                _LOGGER.debug("sky_rics listener failed", exc_info=True)
 
     def _get_policy(self):
         from sky_rics.exclusions import SafetyPolicy
@@ -191,6 +216,7 @@ class SkyRicsHub:
         """Establish a pair+bind session and report bound state. No key sent."""
         ip = self.resolve_ip()
         if not ip:
+            self._set_session(bound=False, reason="no-ip", device_name="", bind_id=None)
             return {"bound": False, "reason": "no-ip", "device_name": "", "bind_id": None}
         session = self._session(ip)
         try:
@@ -198,11 +224,14 @@ class SkyRicsHub:
             session.websocket_handshake()
             pair = session.pair()
             if not pair.get("status"):
+                self._set_session(bound=False, reason="pair-failed", device_name=session.device_name, bind_id=None)
                 return {"bound": False, "reason": "pair-failed", "device_name": session.device_name}
             session.device_name = pair.get("name", "")
             bind = session.bind(pair.get("pairingcode", ""), pair.get("stbnonce", ""))
             if not bind.get("status"):
+                self._set_session(bound=False, reason="bind-failed", device_name=session.device_name, bind_id=None)
                 return {"bound": False, "reason": "bind-failed", "device_name": session.device_name}
+            self._set_session(bound=True, reason="ok", device_name=session.device_name, bind_id=session.bind_id)
             return {
                 "bound": True,
                 "reason": "ok",
@@ -211,6 +240,7 @@ class SkyRicsHub:
             }
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("sky_rics bind_state error: %s", exc)
+            self._set_session(bound=False, reason=str(exc), device_name="", bind_id=None)
             return {"bound": False, "reason": str(exc), "device_name": ""}
         finally:
             session.close()
@@ -223,6 +253,7 @@ class SkyRicsHub:
             raise SafetyError("key commands disabled (allow_key_commands=false)")
         ip = self.resolve_ip()
         if not ip:
+            self._set_session(bound=False, reason="no-ip", device_name="", bind_id=None)
             return {"sent": False, "reason": "no-ip"}
         session = self._session(ip)
         try:
@@ -230,14 +261,37 @@ class SkyRicsHub:
             session.websocket_handshake()
             pair = session.pair()
             if not pair.get("status"):
+                self._set_session(bound=False, reason="pair-failed", device_name=session.device_name, bind_id=None)
                 return {"sent": False, "reason": "pair-failed"}
+            session.device_name = pair.get("name", "")
             bind = session.bind(pair.get("pairingcode", ""), pair.get("stbnonce", ""))
             if not bind.get("status"):
+                self._set_session(bound=False, reason="bind-failed", device_name=session.device_name, bind_id=None)
                 return {"sent": False, "reason": "bind-failed"}
+            self._set_session(bound=True, reason="ok", device_name=session.device_name, bind_id=session.bind_id)
             resp = session.send_key(key)
             return {"sent": resp.get("status", False) is True, "reason": "ok", "bind_id": session.bind_id}
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("sky_rics send_key error: %s", exc)
+            self._set_session(bound=False, reason=str(exc), device_name="", bind_id=None)
             return {"sent": False, "reason": str(exc)}
         finally:
             session.close()
+
+
+def get_hub(hass: "HomeAssistant", config) -> SkyRicsHub:
+    """Return the single shared hub for this MAC (one session owner)."""
+    store = hass.data.setdefault(DOMAIN, {})
+    mac = config[CONF_MAC]
+    hub = store.get(mac)
+    if hub is None:
+        hub = SkyRicsHub(
+            mac=mac,
+            exclusions_path=config.get(CONF_EXCLUSIONS, ""),
+            targets_path=config.get(CONF_TARGETS, ""),
+            port=config.get(CONF_PORT, 8091),
+            redact=config.get(CONF_REDACT, True),
+            allow_keys=config.get(CONF_ALLOW_KEYS, False),
+        )
+        store[mac] = hub
+    return hub
