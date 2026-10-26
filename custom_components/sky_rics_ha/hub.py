@@ -280,7 +280,12 @@ class SkyRicsHub:
 
 
 def get_hub(hass: "HomeAssistant", config) -> SkyRicsHub:
-    """Return the single shared hub for this MAC (one session owner)."""
+    """Return the single shared hub for this MAC (one session owner).
+
+    Platforms are set up in arbitrary order and only the remote platform
+    carries allow_key_commands, so an existing hub is upgraded rather than
+    silently keeping the first platform's defaults.
+    """
     store = hass.data.setdefault(DOMAIN, {})
     mac = config[CONF_MAC]
     hub = store.get(mac)
@@ -294,4 +299,6 @@ def get_hub(hass: "HomeAssistant", config) -> SkyRicsHub:
             allow_keys=config.get(CONF_ALLOW_KEYS, False),
         )
         store[mac] = hub
+    elif config.get(CONF_ALLOW_KEYS) and not hub.allow_keys:
+        hub.allow_keys = True
     return hub
