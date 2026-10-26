@@ -2,9 +2,9 @@
 
 Safety-gated Home Assistant integration for the permitted Sky Glass only.
 Provides:
-  - binary_sensor.sky_glass_rics_presence  (device awake; no pairing)
-  - binary_sensor.sky_glass_rics_bound      (pair+bind session ok; no key sent)
-  - remote.sky_glass_remote                  (gated send_command service)
+  - binary_sensor.<name>_rics_reachable  (TCP 8091 up; no pairing)
+  - binary_sensor.<name>_rics_bound      (last session outcome; event-driven)
+  - remote.<name>_remote                 (gated send_command service)
 
 Exclusions and permitted-target policy are loaded from the research config
 (see docs/sky-rics-*). Ruby's device is always excluded.
@@ -31,5 +31,16 @@ def setup(hass: HomeAssistant, config) -> bool:
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
+    from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+
     hass.data.setdefault(DOMAIN, {})
+
+    async def _close_hubs(_event=None) -> None:
+        for hub in list(hass.data.get(DOMAIN, {}).values()):
+            try:
+                await hass.async_add_executor_job(hub.close)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("sky_rics hub close failed", exc_info=True)
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _close_hubs)
     return True

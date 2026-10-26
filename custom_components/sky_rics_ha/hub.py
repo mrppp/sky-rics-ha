@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,6 +59,19 @@ class SkyRicsHub:
         "bound": None, "reason": "no-session", "device_name": "", "bind_id": None,
     })
     _listeners: list = field(default_factory=list)
+
+    # Persistent session state. Measured: idle sessions die between 30s and
+    # 600s, but a 20s WebSocket ping held one for 600s+ and it still accepted a
+    # key. So the session is kept alive by pings and retired on any ping error.
+    ping_interval: float = 20.0
+    idle_retire: float = 90.0
+    _conn: object = None
+    _io_lock: object = field(default_factory=threading.Lock)
+    _keepalive_stop: object = None
+    _keepalive_thread: object = None
+    _last_used: float = 0.0
+    _generation: int = 0
+    _ping_ok: bool = True
 
     def __post_init__(self):
         self._policy = None  # loaded lazily inside executor-thread operations
@@ -184,9 +199,9 @@ class SkyRicsHub:
             _LOGGER.warning("sky_rics: blocked by policy: %s", exc)
             raise
 
-    # -- operations (blocking; run in executor) ------------------------------
+    # -- persistent session ---------------------------------------------------
 
-    def _session(self, ip: str):
+    def _new_session(self, ip: str):
         from sky_rics.client import RicsSession
 
         self.assert_allowed(ip)
@@ -198,6 +213,97 @@ class SkyRicsHub:
             port=self.port,
             _redact=self.redact,
         )
+
+    def _start_keepalive(self) -> None:
+        stop = threading.Event()
+        self._keepalive_stop = stop
+        self._ping_ok = True
+        thread = threading.Thread(
+            target=self._keepalive_loop, args=(stop, self._generation), daemon=True,
+            name=f"sky_rics_keepalive_{self.mac}",
+        )
+        self._keepalive_thread = thread
+        thread.start()
+
+    def _keepalive_loop(self, stop: threading.Event, generation: int) -> None:
+        while not stop.wait(self.ping_interval):
+            if generation != self._generation:
+                return
+            conn = self._conn
+            if conn is None:
+                return
+            try:
+                with self._io_lock:
+                    conn.ping()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("sky_rics keepalive failed: %s", exc)
+                self._ping_ok = False
+                self._drop_session("keepalive-failed")
+                return
+
+    def _drop_session(self, reason: str) -> None:
+        """Retire the current session. Safe to call from any thread."""
+        self._generation += 1
+        stop, self._keepalive_stop = self._keepalive_stop, None
+        if stop is not None:
+            stop.set()
+        conn, self._conn = self._conn, None
+        self._ping_ok = True
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.last_session.get("bound"):
+            self._set_session(bound=False, reason=reason, bind_id=None)
+
+    def _ensure_session(self):
+        """Return a live bound session, opening one if needed.
+
+        Caller must hold `_io_lock`. A session whose last ping failed is never
+        reused. Only one connect/pair/bind attempt is made; a failed bind is
+        not retried (repeated failures risk lockout).
+        """
+        conn = self._conn
+        if conn is not None and self._ping_ok:
+            if time.monotonic() - self._last_used < self.idle_retire:
+                return conn
+            self._drop_session("idle")
+        elif conn is not None:
+            self._drop_session("stale")
+
+        ip = self.resolve_ip()
+        if not ip:
+            self._set_session(bound=False, reason="no-ip", device_name="", bind_id=None)
+            raise ConnectionError("no-ip")
+
+        conn = self._new_session(ip)
+        try:
+            conn.connect()
+            conn.websocket_handshake()
+            pair = conn.pair()
+            if not pair.get("status"):
+                self._set_session(bound=False, reason="pair-failed", device_name="", bind_id=None)
+                raise ConnectionError("pair-failed")
+            conn.device_name = pair.get("name", "")
+            bind = conn.bind(pair.get("pairingcode", ""), pair.get("stbnonce", ""))
+            if not bind.get("status"):
+                self._set_session(bound=False, reason="bind-failed", device_name=conn.device_name, bind_id=None)
+                raise ConnectionError("bind-failed")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._conn = conn
+        self._last_used = time.monotonic()
+        self._set_session(bound=True, reason="ok", device_name=conn.device_name, bind_id=conn.bind_id)
+        self._start_keepalive()
+        return conn
+
+    # -- operations (blocking; run in executor) ------------------------------
 
     def presence(self) -> bool:
         """True if TCP 8091 is reachable (device awake). No pairing, no TLS."""
@@ -213,70 +319,54 @@ class SkyRicsHub:
             return False
 
     def bind_state(self) -> dict:
-        """Establish a pair+bind session and report bound state. No key sent."""
-        ip = self.resolve_ip()
-        if not ip:
-            self._set_session(bound=False, reason="no-ip", device_name="", bind_id=None)
-            return {"bound": False, "reason": "no-ip", "device_name": "", "bind_id": None}
-        session = self._session(ip)
+        """Report bound state, reusing the live session when there is one."""
         try:
-            session.connect()
-            session.websocket_handshake()
-            pair = session.pair()
-            if not pair.get("status"):
-                self._set_session(bound=False, reason="pair-failed", device_name=session.device_name, bind_id=None)
-                return {"bound": False, "reason": "pair-failed", "device_name": session.device_name}
-            session.device_name = pair.get("name", "")
-            bind = session.bind(pair.get("pairingcode", ""), pair.get("stbnonce", ""))
-            if not bind.get("status"):
-                self._set_session(bound=False, reason="bind-failed", device_name=session.device_name, bind_id=None)
-                return {"bound": False, "reason": "bind-failed", "device_name": session.device_name}
-            self._set_session(bound=True, reason="ok", device_name=session.device_name, bind_id=session.bind_id)
-            return {
-                "bound": True,
-                "reason": "ok",
-                "device_name": session.device_name,
-                "bind_id": session.bind_id,
-            }
+            with self._io_lock:
+                conn = self._ensure_session()
+                self._last_used = time.monotonic()
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("sky_rics bind_state error: %s", exc)
-            self._set_session(bound=False, reason=str(exc), device_name="", bind_id=None)
-            return {"bound": False, "reason": str(exc), "device_name": ""}
-        finally:
-            session.close()
+            reason = str(exc) or exc.__class__.__name__
+            return {"bound": False, "reason": reason, "device_name": "", "bind_id": None}
+        return {
+            "bound": True,
+            "reason": "ok",
+            "device_name": conn.device_name,
+            "bind_id": conn.bind_id,
+        }
 
     def send_key(self, key: str) -> dict:
-        """Send exactly one key command to the permitted device."""
+        """Send exactly one key command to the permitted device.
+
+        A failure after the frame may have been written is reported as
+        `uncertain` — the key may have executed even though no response came.
+        """
         from sky_rics.exclusions import SafetyError
 
         if not self.allow_keys:
             raise SafetyError("key commands disabled (allow_key_commands=false)")
-        ip = self.resolve_ip()
-        if not ip:
-            self._set_session(bound=False, reason="no-ip", device_name="", bind_id=None)
-            return {"sent": False, "reason": "no-ip"}
-        session = self._session(ip)
-        try:
-            session.connect()
-            session.websocket_handshake()
-            pair = session.pair()
-            if not pair.get("status"):
-                self._set_session(bound=False, reason="pair-failed", device_name=session.device_name, bind_id=None)
-                return {"sent": False, "reason": "pair-failed"}
-            session.device_name = pair.get("name", "")
-            bind = session.bind(pair.get("pairingcode", ""), pair.get("stbnonce", ""))
-            if not bind.get("status"):
-                self._set_session(bound=False, reason="bind-failed", device_name=session.device_name, bind_id=None)
-                return {"sent": False, "reason": "bind-failed"}
-            self._set_session(bound=True, reason="ok", device_name=session.device_name, bind_id=session.bind_id)
-            resp = session.send_key(key)
-            return {"sent": resp.get("status", False) is True, "reason": "ok", "bind_id": session.bind_id}
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("sky_rics send_key error: %s", exc)
-            self._set_session(bound=False, reason=str(exc), device_name="", bind_id=None)
-            return {"sent": False, "reason": str(exc)}
-        finally:
-            session.close()
+        with self._io_lock:
+            try:
+                conn = self._ensure_session()
+            except Exception as exc:  # noqa: BLE001
+                reason = str(exc) or exc.__class__.__name__
+                return {"sent": False, "reason": reason}
+            try:
+                response = conn.send_key(key)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("sky_rics send_key error: %s", exc)
+                self._drop_session("connection-lost")
+                return {"sent": False, "reason": str(exc), "uncertain": True}
+            self._last_used = time.monotonic()
+            return {
+                "sent": response.get("status", False) is True,
+                "reason": "ok",
+                "bind_id": conn.bind_id,
+            }
+
+    def close(self) -> None:
+        """Retire the session (used on unload)."""
+        with self._io_lock:
+            self._drop_session("closed")
 
 
 def get_hub(hass: "HomeAssistant", config) -> SkyRicsHub:

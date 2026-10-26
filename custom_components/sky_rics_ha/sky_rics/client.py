@@ -15,7 +15,7 @@ from .auth import compute_auth_token
 from .exclusions import DeviceIdentity, SafetyError, SafetyPolicy
 from .protocol import build_bind_request, build_key_command, build_pair_request
 from .tls import client_leaf_fingerprint, create_client_context, default_credential_paths
-from .websocket import TEXT, build_client_frame, read_server_frame
+from .websocket import PING, TEXT, build_client_frame, read_server_frame
 
 
 @dataclass
@@ -129,6 +129,16 @@ class RicsSession:
             raise SafetyError("cannot send key without a successful bind")
         self.send_json(build_key_command(self.tid, self.auth_token, self.bind_id, key))
         return self.recv_json()
+
+    def ping(self) -> None:
+        """Send a protocol-level WebSocket ping (no application JSON).
+
+        Any PONG is skipped by recv_json, so this is safe to interleave with
+        real traffic.
+        """
+        if not self.sock:
+            raise RuntimeError("not connected")
+        self.sock.sendall(build_client_frame(b"", PING))
 
     def close(self) -> None:
         if self.sock:
