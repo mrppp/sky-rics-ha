@@ -21,13 +21,29 @@ from .tv_state import TV_DWELL_S, TV_OFF_W, TV_ON_W, classify
 _LOGGER = logging.getLogger(__name__)
 
 
+def _find_power_entity(hass, base_name: str) -> str | None:
+    """Find a power sensor for this device when none is configured.
+
+    Matches a `power` device_class sensor whose friendly name starts with the
+    configured device name (e.g. "Sky Glass Power"). Explicit config wins.
+    """
+    prefix = base_name.lower()
+    for state in hass.states.async_all("sensor"):
+        if state.attributes.get("device_class") != "power":
+            continue
+        friendly = str(state.attributes.get("friendly_name", "")).lower()
+        if friendly.startswith(prefix):
+            return state.entity_id
+    return None
+
+
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     hub = get_hub(hass, config)
     name = config.get(CONF_NAME, "Sky Glass")
     interval = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     entities = [SkyReachableSensor(hass, hub, name, interval),
                 SkyBoundSensor(hass, hub, name)]
-    power_entity = config.get(CONF_POWER_ENTITY)
+    power_entity = config.get(CONF_POWER_ENTITY) or _find_power_entity(hass, name)
     if power_entity:
         entities.append(SkyTvOnSensor(hass, hub, name, power_entity))
     async_add_entities(entities)
