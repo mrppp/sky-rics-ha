@@ -43,9 +43,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     interval = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     entities = [SkyReachableSensor(hass, hub, name, interval),
                 SkyBoundSensor(hass, hub, name)]
-    power_entity = config.get(CONF_POWER_ENTITY) or _find_power_entity(hass, name)
-    if power_entity:
-        entities.append(SkyTvOnSensor(hass, hub, name, power_entity))
+    power_entity = config.get(CONF_POWER_ENTITY)
+    entities.append(SkyTvOnSensor(hass, hub, name, power_entity))
     async_add_entities(entities)
 
 
@@ -150,8 +149,9 @@ class SkyTvOnSensor(_SkySensor):
     _attr_icon = "mdi:television"
     _attr_device_class = "power"
 
-    def __init__(self, hass, hub: SkyRicsHub, base_name: str, power_entity: str):
+    def __init__(self, hass, hub: SkyRicsHub, base_name: str, power_entity: str | None):
         super().__init__(hass, hub, base_name)
+        self._base = base_name
         self._power_entity = power_entity
         self._pending = None
         self._cancel = None
@@ -166,8 +166,32 @@ class SkyTvOnSensor(_SkySensor):
         return f"sky_rics_ha_{self._hub.mac.replace(':','')}_tv_on"
 
     async def async_added_to_hass(self) -> None:
+        from homeassistant.helpers.event import async_track_time_interval
+
+        # The power sensor may not exist yet at platform setup, so resolve it
+        # lazily and keep retrying until it appears.
+        self._resolve()
+        if self._power_entity is None:
+            self.async_on_remove(
+                async_track_time_interval(
+                    self.hass, self._retry_resolve, timedelta(seconds=60)
+                )
+            )
+
+    def _retry_resolve(self, _now=None) -> None:
+        if self._power_entity is not None:
+            return
+        self._resolve()
+        if self._power_entity is not None:
+            self._evaluate(self.hass.states.get(self._power_entity))
+
+    def _resolve(self) -> None:
         from homeassistant.helpers.event import async_track_state_change_event
 
+        if self._power_entity is None:
+            self._power_entity = _find_power_entity(self.hass, self._base)
+        if self._power_entity is None:
+            return
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass, [self._power_entity], self._on_power
