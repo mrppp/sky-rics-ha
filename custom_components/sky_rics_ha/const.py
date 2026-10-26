@@ -11,6 +11,9 @@ CONF_PRIVATE_KEY = "private_key"
 CONF_ALLOW_KEYS = "allow_key_commands"
 CONF_SCAN_INTERVAL = "scan_interval_seconds"
 CONF_REDACT = "redact_logs"
+CONF_WAKE_ON_ANY_KEY = "wake_on_any_key"
+CONF_WAKE_SETTLE = "wake_settle_seconds"
+CONF_POWER_ENTITY = "power_entity"
 
 DEFAULT_PORT = 8091
 DEFAULT_SCAN_INTERVAL = 60

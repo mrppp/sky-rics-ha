@@ -14,8 +14,9 @@ from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+from .const import (CONF_POWER_ENTITY, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 from .hub import SkyRicsHub, get_hub
+from .tv_state import TV_DWELL_S, TV_OFF_W, TV_ON_W, classify
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,8 +25,12 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     hub = get_hub(hass, config)
     name = config.get(CONF_NAME, "Sky Glass")
     interval = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    async_add_entities([SkyReachableSensor(hass, hub, name, interval),
-                        SkyBoundSensor(hass, hub, name)])
+    entities = [SkyReachableSensor(hass, hub, name, interval),
+                SkyBoundSensor(hass, hub, name)]
+    power_entity = config.get(CONF_POWER_ENTITY)
+    if power_entity:
+        entities.append(SkyTvOnSensor(hass, hub, name, power_entity))
+    async_add_entities(entities)
 
 
 class _SkySensor(BinarySensorEntity):
@@ -116,3 +121,97 @@ class SkyBoundSensor(_SkySensor):
             "bind_id": state.get("bind_id"),
             "mac": self._hub.mac,
         }
+
+
+class SkyTvOnSensor(_SkySensor):
+    """Estimated panel state from a power sensor.
+
+    RICS has no state query, so this is an estimate, not a fact. Hysteresis
+    (3 W off / 20 W on) plus a 60s dwell keeps the standby oscillation and
+    brief dips from flapping it. Stale or unavailable readings become unknown.
+    """
+
+    _attr_icon = "mdi:television"
+    _attr_device_class = "power"
+
+    def __init__(self, hass, hub: SkyRicsHub, base_name: str, power_entity: str):
+        super().__init__(hass, hub, base_name)
+        self._power_entity = power_entity
+        self._pending = None
+        self._cancel = None
+        self._last_reading = None
+
+    @property
+    def name(self):
+        return f"{self._base_name} TV on"
+
+    @property
+    def unique_id(self):
+        return f"sky_rics_ha_{self._hub.mac.replace(':','')}_tv_on"
+
+    async def async_added_to_hass(self) -> None:
+        from homeassistant.helpers.event import async_track_state_change_event
+
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass, [self._power_entity], self._on_power
+            )
+        )
+        self._evaluate(self.hass.states.get(self._power_entity))
+
+    def _on_power(self, event) -> None:
+        self._evaluate(event.data.get("new_state"))
+
+    def _evaluate(self, state) -> None:
+        watts = None
+        if state is not None and state.state not in ("unavailable", "unknown", None):
+            try:
+                watts = float(state.state)
+            except (TypeError, ValueError):
+                watts = None
+
+        if watts is None:
+            self._attr_is_on = None
+            self._attr_extra_state_attributes = {
+                "source": self._power_entity, "watts": None, "reason": "no-reading",
+            }
+            self.async_write_ha_state()
+            return
+
+        self._last_reading = watts
+        candidate = classify(watts, self._attr_is_on)
+
+        if candidate is None or candidate == self._attr_is_on:
+            self._pending = None
+            if self._cancel:
+                self._cancel()
+                self._cancel = None
+            self._publish(watts, "held" if candidate == self._attr_is_on else "init")
+            return
+
+        if self._pending is candidate:
+            return  # already waiting out the dwell
+        self._pending = candidate
+        if self._cancel:
+            self._cancel()
+        from homeassistant.helpers.event import async_call_later
+
+        self._cancel = async_call_later(
+            self.hass, TV_DWELL_S, lambda _now: self._commit(candidate)
+        )
+
+    def _commit(self, candidate) -> None:
+        self._cancel = None
+        self._pending = None
+        self._attr_is_on = candidate
+        self._publish(self._last_reading, "dwell")
+
+    def _publish(self, watts, reason: str) -> None:
+        self._attr_extra_state_attributes = {
+            "source": self._power_entity,
+            "watts": watts,
+            "reason": reason,
+            "off_threshold_w": TV_OFF_W,
+            "on_threshold_w": TV_ON_W,
+        }
+        self.async_write_ha_state()

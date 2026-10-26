@@ -3,6 +3,8 @@ send_command:
   description: >-
     Send exactly one RICS key to the permitted device. Requires
     allow_key_commands: true; forbidden pseudo-keys are always blocked.
+    Power wakes the device first; other keys fail fast with reason "asleep"
+    and start a background wake.
   fields:
     key:
       name: Key
@@ -11,3 +13,9 @@ send_command:
       example: Info
       selector:
         text:
+
+wake:
+  name: Wake
+  description: >-
+    Wake the device and wait for it to settle, without injecting a key.
+    Use this when an automation needs the TV awake but must not toggle Power.

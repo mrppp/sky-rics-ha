@@ -36,10 +36,21 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
             _LOGGER.warning("sky_rics: key %s not sent: %s", key, result.get("reason"))
         return result
 
+    async def handle_wake(call: ServiceCall):
+        """Wake the device without injecting a key (Power is a toggle)."""
+        ok = await hass.async_add_executor_job(hub.wake)
+        return {"awake": ok}
+
     hass.services.async_register(
         DOMAIN,
         "send_command",
         handle_send_command,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "wake",
+        handle_wake,
         supports_response=SupportsResponse.OPTIONAL,
     )
 

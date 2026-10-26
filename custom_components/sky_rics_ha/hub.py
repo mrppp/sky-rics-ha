@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .const import (CONF_ALLOW_KEYS, CONF_EXCLUSIONS, CONF_MAC, CONF_PORT,
-                    CONF_REDACT, CONF_TARGETS, DOMAIN)
+                    CONF_REDACT, CONF_TARGETS, CONF_WAKE_ON_ANY_KEY,
+                    CONF_WAKE_SETTLE, DOMAIN)
 
 if TYPE_CHECKING:  # pragma: no cover
     from homeassistant.core import HomeAssistant
@@ -65,8 +66,12 @@ class SkyRicsHub:
     # key. So the session is kept alive by pings and retired on any ping error.
     ping_interval: float = 20.0
     idle_retire: float = 90.0
+    wake_settle: float = 30.0
+    wake_timeout: float = 45.0
+    wake_on_any_key: bool = False
     _conn: object = None
     _io_lock: object = field(default_factory=threading.Lock)
+    _wake_lock: object = field(default_factory=threading.Lock)
     _keepalive_stop: object = None
     _keepalive_thread: object = None
     _last_used: float = 0.0
@@ -318,6 +323,48 @@ class SkyRicsHub:
         except OSError:
             return False
 
+    # -- wake -----------------------------------------------------------------
+
+    def wake(self) -> bool:
+        """Wake the device and wait for it to settle.
+
+        Measured: a key sent the instant 8091 opens aborts the boot and drops
+        the device back to standby, so the settle delay is load-bearing.
+        """
+        from sky_rics.wake import send_wol, wait_for_port
+
+        with self._wake_lock:
+            if self.presence():
+                return True
+            ip = self.resolve_ip()
+            if not ip:
+                return False
+            send_wol(self.mac)
+            if not wait_for_port(ip, self.port, self.wake_timeout):
+                return False
+            time.sleep(self.wake_settle)
+            return True
+
+    def _wake_in_background(self) -> None:
+        if self._wake_lock.locked():
+            return
+        threading.Thread(
+            target=self._safe_wake, daemon=True, name=f"sky_rics_wake_{self.mac}"
+        ).start()
+
+    def _safe_wake(self) -> None:
+        try:
+            self.wake()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("sky_rics background wake failed", exc_info=True)
+
+    def _asleep(self, key: str) -> dict:
+        """Handle a command aimed at a device that is not reachable."""
+        if key == "Power" or self.wake_on_any_key:
+            return {}  # caller should wake then send
+        self._wake_in_background()
+        return {"sent": False, "reason": "asleep", "waking": True}
+
     def bind_state(self) -> dict:
         """Report bound state, reusing the live session when there is one."""
         try:
@@ -344,6 +391,14 @@ class SkyRicsHub:
 
         if not self.allow_keys:
             raise SafetyError("key commands disabled (allow_key_commands=false)")
+
+        if not self.presence():
+            asleep = self._asleep(key)
+            if asleep:
+                return asleep
+            if not self.wake():
+                return {"sent": False, "reason": "wake-failed"}
+
         with self._io_lock:
             try:
                 conn = self._ensure_session()
@@ -387,6 +442,8 @@ def get_hub(hass: "HomeAssistant", config) -> SkyRicsHub:
             port=config.get(CONF_PORT, 8091),
             redact=config.get(CONF_REDACT, True),
             allow_keys=config.get(CONF_ALLOW_KEYS, False),
+            wake_on_any_key=config.get(CONF_WAKE_ON_ANY_KEY, False),
+            wake_settle=config.get(CONF_WAKE_SETTLE, 30.0),
         )
         store[mac] = hub
     elif config.get(CONF_ALLOW_KEYS) and not hub.allow_keys:
