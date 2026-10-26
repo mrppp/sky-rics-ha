@@ -100,6 +100,10 @@ class SkyBoundSensor(_SkySensor):
         self.async_on_remove(self._hub.add_listener(self._on_hub_change))
 
     def _on_hub_change(self) -> None:
+        """Called from the executor thread; hop to the event loop."""
+        self.hass.loop.call_soon_threadsafe(self._write)
+
+    def _write(self) -> None:
         self._apply()
         self.async_write_ha_state()
 
