@@ -25,16 +25,20 @@ def _find_power_entity(hass, base_name: str) -> str | None:
     """Find a power sensor for this device when none is configured.
 
     Matches a `power` device_class sensor whose friendly name starts with the
-    configured device name (e.g. "Sky Glass Power"). Explicit config wins.
+    configured device name (e.g. "Sky Glass Power"), falling back to an
+    entity_id ending in `_power` with the same friendly-name prefix.
     """
     prefix = base_name.lower()
+    fallback = None
     for state in hass.states.async_all("sensor"):
-        if state.attributes.get("device_class") != "power":
-            continue
         friendly = str(state.attributes.get("friendly_name", "")).lower()
-        if friendly.startswith(prefix):
+        if not friendly.startswith(prefix):
+            continue
+        if state.attributes.get("device_class") == "power":
             return state.entity_id
-    return None
+        if fallback is None and state.entity_id.endswith("_power"):
+            fallback = state.entity_id
+    return fallback
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -191,6 +195,10 @@ class SkyTvOnSensor(_SkySensor):
         if self._power_entity is None:
             self._power_entity = _find_power_entity(self.hass, self._base)
         if self._power_entity is None:
+            self._attr_extra_state_attributes = {
+                "reason": "no-power-entity", "base_name": self._base,
+            }
+            self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
             return
         self.async_on_remove(
             async_track_state_change_event(
@@ -254,4 +262,5 @@ class SkyTvOnSensor(_SkySensor):
             "off_threshold_w": TV_OFF_W,
             "on_threshold_w": TV_ON_W,
         }
-        self.async_write_ha_state()
+        # Safe from either the loop or a thread.
+        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
